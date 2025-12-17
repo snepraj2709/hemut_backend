@@ -10,6 +10,16 @@ load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./qa_dashboard.db")
 
+# Sanitize DATABASE_URL (Fix common Neon/Heroku copy-paste errors)
+if DATABASE_URL:
+    # Remove 'psql ' prefix if present
+    if DATABASE_URL.startswith("psql "):
+        DATABASE_URL = DATABASE_URL.replace("psql ", "").strip("'\"")
+    
+    # Fix legacy 'postgres://' protocol (SQLAlchemy 1.4+ requires postgresql://)
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
 # Create engine
 engine = create_engine(
     DATABASE_URL,

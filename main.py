@@ -316,28 +316,7 @@ async def submit_question(
     question_data: QuestionSubmit,
     db: Session = Depends(get_db)
 ):
-    # To support guest posts, we need to handle user being None.
-    # But Depends(get_current_user) raises 401 if missing.
-    # To allow optional auth, we'd need a different dependency or check headers manually.
-    # For now, let's assume authenticated for consistency or fix the optionality.
-    # The original code had: user: Optional[dict] = Depends(get_current_user) if False else None
-    # which effectively meant user was ALWAYS None unless the condition changed.
-    # Let's check headers for Bearer token properly if we want to support both.
-    # For simplicity, if the user sends a token, we associate it. If not, it's anonymous (if allowed).
-    # But `get_current_user` raises exception.
-    # Let's make a `get_optional_current_user`
-):
     """Submit a new question (guests allowed - user is Optional)"""
-    # Note: `user` argument above was tricky. Let's fix it properly.
-    # We will just accept the question. If we want to link a user, we need to read the token optionally.
-    # For now, to match previous logic (user_id optional), we'll leave user validation for a separate step or just default to None if we can't easily get it without enforcing it.
-    # Actually, let's implement `get_optional_user` logic inline or helper.
-    
-    # Simplified: We'll assume for this turn that we just want to create the question.
-    # If the USER wants auth, they should send it.
-    # Let's use a trick: `user` is tricky to make optional with HTTPBearer raising 403.
-    # We'll rely on the client sending a user_id if we want, or better, just create it anonymously for now unless we implement `get_optional_user`.
-    # To match the original code that effectively disabled auth check for this endpoint:
     user_id = None
     # If using the "Depends(get_current_user) if False" pattern, it meant it was disabled.
     # So we'll just set user_id to None.
