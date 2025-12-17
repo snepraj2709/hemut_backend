@@ -140,7 +140,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
-        "https://qna-dashboard.netlify.app/"
+        "https://qna-dashboard.netlify.app"
     ],
     allow_credentials=True,
     allow_methods=["*"],
