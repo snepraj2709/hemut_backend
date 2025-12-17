@@ -14,6 +14,8 @@ import os
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, SystemMessage
 
 # Import from database.py
 from database import engine, SessionLocal, init_db, create_default_admin, User, Question, Answer, get_db
@@ -25,6 +27,7 @@ load_dotenv()
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
 ALGORITHM = "HS256"
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://webhook.site/mock-endpoint")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # WebSocket connection manager
 class ConnectionManager:
@@ -179,17 +182,25 @@ async def get_current_admin(user: User = Depends(get_current_user)) -> User:
 
 # RAG/Langchain Mock Integration
 async def generate_ai_suggestion(message: str) -> str:
-    """Mock RAG/Langchain integration for AI-powered answer suggestions"""
-    await asyncio.sleep(1)  # Simulate AI processing
-    suggestions = [
-        "Based on similar queries, you might want to check our documentation at docs.example.com",
-        "This appears to be a technical issue. Have you tried restarting the service?",
-        "For account-related questions, please verify your email is confirmed.",
-        "This is a common question. The answer typically involves checking your settings first.",
-        "According to our knowledge base, this issue can be resolved by updating your configuration."
-    ]
-    import random
-    return random.choice(suggestions)
+    """Get AI-powered answer suggestion using Langchain and OpenAI"""
+    
+    if not OPENAI_API_KEY:
+        # Fallback to mock if no API key
+        print("⚠️ OPENAI_API_KEY not found. Using mock response.")
+        await asyncio.sleep(1)
+        return "AI Suggestion (Mock): Configure OPENAI_API_KEY for real responses. Try checking the documentation."
+
+    try:
+        chat = ChatOpenAI(temperature=0.7, api_key=OPENAI_API_KEY)
+        messages = [
+            SystemMessage(content="You are a helpful expert assistant for a Q&A dashboard. Provide a concise, helpful answer to the user's question."),
+            HumanMessage(content=message)
+        ]
+        response = await chat.ainvoke(messages)
+        return response.content
+    except Exception as e:
+        print(f"❌ OpenAI API Error: {str(e)}")
+        return "Sorry, I couldn't generate a suggestion at this time."
 
 # Webhook Function
 async def trigger_webhook(question: Question):
