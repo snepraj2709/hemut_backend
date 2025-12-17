@@ -32,21 +32,34 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # WebSocket connection manager
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: List[WebSocket] = []
+        self.active_connections: Dict[WebSocket, Optional[int]] = {}  # WebSocket -> user_id mapping
 
-    async def connect(self, websocket: WebSocket):
+    async def connect(self, websocket: WebSocket, user_id: Optional[int] = None):
         await websocket.accept()
-        self.active_connections.append(websocket)
+        self.active_connections[websocket] = user_id
 
     def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+        if websocket in self.active_connections:
+            del self.active_connections[websocket]
+
+    async def send_personal_message(self, message: dict, websocket: WebSocket):
+        try:
+            await websocket.send_json(message)
+        except Exception as e:
+            print(f"Error sending personal message: {e}")
 
     async def broadcast(self, message: dict):
-        for connection in self.active_connections:
+        disconnected = []
+        for connection in self.active_connections.keys():
             try:
                 await connection.send_json(message)
-            except:
-                pass
+            except Exception as e:
+                print(f"Error broadcasting to connection: {e}")
+                disconnected.append(connection)
+        
+        # Clean up disconnected clients
+        for connection in disconnected:
+            self.disconnect(connection)
 
 manager = ConnectionManager()
 
@@ -205,21 +218,24 @@ async def generate_ai_suggestion(message: str) -> str:
         print(f"❌ OpenAI API Error: {str(e)}")
         return "Sorry, I couldn't generate a suggestion at this time."
 
-# Webhook Function
-async def trigger_webhook(question: Question):
-    """Send webhook notification when question is answered"""
+# Webhook Functions
+async def trigger_webhook(event_type: str, data: dict):
+    """Send webhook notification for various events"""
+    if not WEBHOOK_URL or WEBHOOK_URL == "https://webhook.site/mock-endpoint":
+        print(f"⚠️ Webhook URL not configured, skipping webhook for {event_type}")
+        return
+    
     try:
         async with httpx.AsyncClient() as client:
             payload = {
-                "event": "question_answered",
-                "question_id": question.question_id,
-                "message": question.message,
+                "event": event_type,
+                "data": data,
                 "timestamp": datetime.now().isoformat()
             }
             response = await client.post(WEBHOOK_URL, json=payload, timeout=5.0)
-            print(f"✅ Webhook sent to {WEBHOOK_URL}: {response.status_code}")
+            print(f"✅ Webhook sent to {WEBHOOK_URL} [{event_type}]: {response.status_code}")
     except Exception as e:
-        print(f"❌ Webhook failed: {str(e)}")
+        print(f"❌ Webhook failed [{event_type}]: {str(e)}")
 
 # API Endpoints
 
@@ -346,12 +362,16 @@ async def submit_question(
     db.refresh(new_question)
     
     # Broadcast to WebSocket clients
+    question_data = new_question.to_dict()
     await manager.broadcast({
         "type": "new_question",
-        "data": new_question.to_dict()
+        "data": question_data
     })
     
-    return new_question.to_dict()
+    # Trigger webhook for new question
+    asyncio.create_task(trigger_webhook("question_created", question_data))
+    
+    return question_data
 
 @app.get("/api/questions", response_model=List[QuestionResponse])
 async def get_questions(db: Session = Depends(get_db)):
@@ -408,10 +428,18 @@ async def add_answer(
     db.refresh(new_answer)
     
     # Broadcast update
+    question_data = question.to_dict(include_answers=True)
     await manager.broadcast({
-        "type": "question_updated",
-        "data": question.to_dict()
+        "type": "answer_added",
+        "data": question_data
     })
+    
+    # Trigger webhook for new answer
+    asyncio.create_task(trigger_webhook("answer_created", {
+        "question_id": question_id,
+        "answer": new_answer.to_dict(),
+        "question": question_data
+    }))
     
     return {"message": "Answer added successfully", "answer": new_answer.to_dict()}
 
@@ -430,16 +458,18 @@ async def mark_answered(
     db.commit()
     db.refresh(question)
     
+    question_data = question.to_dict(include_answers=True)
+    
     # Trigger webhook
-    asyncio.create_task(trigger_webhook(question))
+    asyncio.create_task(trigger_webhook("question_answered", question_data))
     
     # Broadcast update
     await manager.broadcast({
-        "type": "question_updated",
-        "data": question.to_dict()
+        "type": "question_status_changed",
+        "data": question_data
     })
     
-    return {"message": "Question marked as answered", "question": question.to_dict()}
+    return {"message": "Question marked as answered", "question": question_data}
 
 @app.put("/api/questions/{question_id}/escalate")
 async def escalate_question(
@@ -456,13 +486,18 @@ async def escalate_question(
     db.commit()
     db.refresh(question)
     
+    question_data = question.to_dict(include_answers=True)
+    
+    # Trigger webhook
+    asyncio.create_task(trigger_webhook("question_escalated", question_data))
+    
     # Broadcast update
     await manager.broadcast({
-        "type": "question_updated",
-        "data": question.to_dict()
+        "type": "question_status_changed",
+        "data": question_data
     })
     
-    return {"message": "Question escalated", "question": question.to_dict()}
+    return {"message": "Question escalated", "question": question_data}
 
 @app.post("/api/questions/{question_id}/ai-suggest")
 async def get_ai_suggestion(question_id: int, db: Session = Depends(get_db)):
@@ -482,16 +517,91 @@ async def get_ai_suggestion(question_id: int, db: Session = Depends(get_db)):
 # WebSocket Endpoint
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
+async def websocket_endpoint(websocket: WebSocket, token: Optional[str] = None):
+    """WebSocket endpoint for real-time updates
+    
+    Usage:
+    - Connect to ws://localhost:8000/ws or ws://localhost:8000/ws?token=YOUR_JWT_TOKEN
+    - Optionally send authentication via first message: {"type": "auth", "token": "YOUR_JWT_TOKEN"}
+    - Receive real-time updates for questions, answers, and status changes
+    - Send ping messages to keep connection alive: {"type": "ping"}
+    """
+    user_id = None
+    
+    # Try to authenticate from query parameter
+    if token:
+        try:
+            token_data = decode_access_token(token)
+            user_id = token_data.get("user_id")
+        except:
+            pass
+    
+    await manager.connect(websocket, user_id)
+    
+    # Get database session
+    db = SessionLocal()
+    
     try:
+        # Send initial data - all questions
+        questions = db.query(Question).all()
+        questions.sort(key=lambda q: (
+            0 if q.status == "Escalated" else 1,
+            -q.timestamp.timestamp() if q.timestamp else 0
+        ))
+        
+        await manager.send_personal_message({
+            "type": "initial_data",
+            "data": [q.to_dict(include_answers=True) for q in questions]
+        }, websocket)
+        
+        # Keep connection alive and handle client messages
         while True:
-            # Keep connection alive and receive messages
-            data = await websocket.receive_text()
-            # Echo back or handle client messages if needed
-            await websocket.send_json({"type": "pong", "message": "Connection alive"})
+            message = await websocket.receive_json()
+            
+            # Handle authentication message
+            if message.get("type") == "auth":
+                auth_token = message.get("token")
+                if auth_token:
+                    try:
+                        token_data = decode_access_token(auth_token)
+                        user_id = token_data.get("user_id")
+                        manager.active_connections[websocket] = user_id
+                        await manager.send_personal_message({
+                            "type": "auth_success",
+                            "user_id": user_id
+                        }, websocket)
+                    except:
+                        await manager.send_personal_message({
+                            "type": "auth_error",
+                            "message": "Invalid token"
+                        }, websocket)
+            
+            # Handle ping/pong for keepalive
+            elif message.get("type") == "ping":
+                await manager.send_personal_message({
+                    "type": "pong",
+                    "timestamp": datetime.now().isoformat()
+                }, websocket)
+            
+            # Handle refresh request
+            elif message.get("type") == "refresh":
+                questions = db.query(Question).all()
+                questions.sort(key=lambda q: (
+                    0 if q.status == "Escalated" else 1,
+                    -q.timestamp.timestamp() if q.timestamp else 0
+                ))
+                await manager.send_personal_message({
+                    "type": "refresh_data",
+                    "data": [q.to_dict(include_answers=True) for q in questions]
+                }, websocket)
+                
     except WebSocketDisconnect:
         manager.disconnect(websocket)
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+        manager.disconnect(websocket)
+    finally:
+        db.close()
 
 if __name__ == "__main__":
     import uvicorn
